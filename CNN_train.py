@@ -1,10 +1,10 @@
 from torchvision import datasets
-import torchvision.transforms as transforms
+import torchvision.transforms.v2 as transforms
 import torch.optim as optim
 import time
 
 from classification_utils import *
-from cifar_models import CNN6, CNN8
+from cifar_models import CNN6, CNN8, CNN10
 from quantized_layers import *
 from model_saving import *
 
@@ -12,16 +12,15 @@ from Orthogonalization import *
 from PearsonCorrelation import *
 from FeaturesCovariance import *
 
-MODEL_ARCH = CNN8
 
-def ptq_model(model, in_bins: int, w_bins: int, symmetric_mode: bool,
+def ptq_model(model_arch, model, in_bins: int, w_bins: int, symmetric_mode: bool,
               train_loader, device='cpu', mode='ada'):
     model = model.to(device)
-    qmodel = MODEL_ARCH()
+    qmodel = model_arch()
     qmodel.load_state_dict(model.state_dict())
     qmodel = qmodel.to(device)
 
-    cmodel = MODEL_ARCH()
+    cmodel = model_arch()
     cmodel.load_state_dict(model.state_dict())
     cmodel = cmodel.to(device)
     N_BLOCKS = 50
@@ -50,9 +49,9 @@ def ptq_model(model, in_bins: int, w_bins: int, symmetric_mode: bool,
     return qmodel
 
 
-def gradual_freeze_model(qmodel, train_loader, test_loader, device, model_update):
+def gradual_freeze_model(model_arch, qmodel, train_loader, test_loader, device, model_update):
     EP_FREEZE = 3
-    fmodel = MODEL_ARCH(quantized=True).to(device)
+    fmodel = model_arch(quantized=True).to(device)
     fmodel.load_state_dict(qmodel.state_dict())
 
     train_stat, test_stat = None, None
@@ -69,13 +68,13 @@ def gradual_freeze_model(qmodel, train_loader, test_loader, device, model_update
                                       model_update=model_update)
     return fmodel, train_stat, test_stat
 
-def quantization(name, model, in_bins, weight_bins, test_loader, train_loader, symmetric=True,
+def quantization(model_arch, name, model, in_bins, weight_bins, test_loader, train_loader, symmetric=True,
                  model_update=None, device='cpu'):
     quant_start = time()
-    quantized_model = ptq_model(model, in_bins, weight_bins, symmetric, train_loader, device=device)
+    quantized_model = ptq_model(model_arch, model, in_bins, weight_bins, symmetric, train_loader, device=device)
     save_model(quantized_model, f'{name}_ptq', test_loader, device=device)
 
-    frozen_model, train_stat, test_stat = gradual_freeze_model(quantized_model, train_loader, test_loader, device=device,
+    frozen_model, train_stat, test_stat = gradual_freeze_model(model_arch, quantized_model, train_loader, test_loader, device=device,
                                                                model_update=model_update)
     quant_end = time()
     save_model(frozen_model, f'{name}_quant', test_loader, quant_end - quant_start, device)
@@ -93,6 +92,8 @@ transformer_test = transforms.Compose([
         transforms.ToTensor(),
 ])
 
+MODEL_ARCHS = [CNN6]
+model_arch_names = ["CNN6"]
 DATA_PATH = './data'
 BATCH_SIZE = 100
 
@@ -102,54 +103,101 @@ test_set = datasets.CIFAR10(DATA_PATH, train=False, transform=transformer_test, 
 test_loader = torch.utils.data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False)
 
 
-step_epochs = 50
+step_epochs = 100
 
 lr_scale = 0.5
 n_steps = 1
 
-to_train_model = MODEL_ARCH()       # model
-device = torch.device("cpu")
+repeat = 3
 
-NAME = "CNN8_f_cov"
-feat_cov_reg = 1
+for m_arch, m_arch_name in zip(MODEL_ARCHS, model_arch_names):
+    for method in ["pc_not_0"]:
+        for rep in range(repeat):
+            cof_pc = 0.1
+            print("TRAINING", method, "ON", m_arch_name, "WITH", cof_pc, "REPEAT", rep)
+            to_train_model = m_arch()       # model
+            device = torch.device("cpu")
 
-optimizer = optim.AdamW(to_train_model.parameters(), lr=2e-3, weight_decay=1e-5)
+            feat_cov_reg = 0.5
+            NAME = f"{m_arch_name}_{method}_{cof_pc}_repeat_{rep}"
 
-mean_corrs = []    # method
-corrs_l = [[] for _ in to_train_model.conv_layers]
-pearson_corr = count_mean_filter_correlation_model(mean_corrs, corrs_l)
 
-fc_reg = feat_cov_loss(feat_cov_reg, [0, 1])
+            optimizer = optim.AdamW(to_train_model.parameters(), lr=2e-3, weight_decay=1e-5)
 
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_epochs, lr_scale)
-loss = nn.CrossEntropyLoss()
+            m_reg = None
+            m_upd = None
+            # mean_corrs = []  # method
+            # corrs_l = [[] for _ in to_train_model.conv_layers]
+            # max_projs = [[] for _ in to_train_model.conv_layers[1:]]
 
-pretrain_start = time()
-train_stat, test_stat = train(to_train_model, optimizer, train_loader, test_loader, loss,
-                                                n_epochs=step_epochs * n_steps, scheduler=scheduler,
-                                                device=device, use_tqdm=True, print_results=False,
-                                                model_regularization=fc_reg,
-                                                model_update=pearson_corr)
-pretrain_end = time()
+            mean_corrs = None
+            corrs_l = None
+            max_projs = None
 
-save_model(to_train_model, f'{NAME}_pretrain', test_loader, pretrain_end - pretrain_start, device=device)
-save_statistics(f'{NAME}_pretrain', train_stat, test_stat)
+            if method == "baseline":
+                pearson_corr = count_mean_filter_correlation_model(mean_corrs, corrs_l)
+                pse_ort = pseudo_ortho(0.0, optimizer, max_projs)
+                m_upd = [pse_ort, pearson_corr]
+            elif method == "pc_not_0":
+                pearson_corr = correlation_loss(cof_pc, mean_corrs, corrs_l)
+                m_reg = pearson_corr
+            elif method == "f_cov":
+                pearson_corr = count_mean_filter_correlation_model(mean_corrs, corrs_l)
+                # m_upd = pearson_corr
+                fc_reg = feat_cov_loss(feat_cov_reg, range(len(to_train_model.pf_caches)))
+                m_reg = fc_reg
+            elif method == "ortho":
+                pearson_corr = count_mean_filter_correlation_model(mean_corrs, corrs_l)
+                m_upd = [ortho_step(0.05, optimizer, max_projs), pearson_corr]
 
-with open(f'{STATISTICS_PATH}/{NAME}_pretrain_corrls_L.json', 'w') as json_file:
-    results = {"mean_corrs": mean_corrs, "corrs_l": corrs_l}
-    json.dump(results, json_file, indent=2)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_epochs, lr_scale)
+            loss = nn.CrossEntropyLoss()
 
-# to_train_model = MODEL_ARCH()
-# to_train_model.load_state_dict(torch.load("models/CNN8_baseline_pretrain.pt", weights_only=True))
+            pretrain_start = time()
+            train_stat, test_stat = train(to_train_model, optimizer, train_loader, test_loader, loss,
+                                                            n_epochs=step_epochs * n_steps, scheduler=scheduler,
+                                                            device=device, use_tqdm=True, print_results=False,
+                                                            model_regularization=m_reg, model_update=m_upd)
+            pretrain_end = time()
+
+            save_model(to_train_model, f'{NAME}_pretrain', test_loader, pretrain_end - pretrain_start, device=device)
+            save_statistics(f'{NAME}_pretrain', train_stat, test_stat)
+
+            with open(f'{STATISTICS_PATH}/{NAME}_pretrain_corrls_L.json', 'w') as json_file:
+                results = {"mean_corrs": mean_corrs, "corrs_l": corrs_l}
+                json.dump(results, json_file, indent=2)
+
+            with open(f'{STATISTICS_PATH}/{NAME}_pretrain_max_proj.json', 'w') as json_file:
+                json.dump(max_projs, json_file, indent=2)
+
+    # to_train_model = MODEL_ARCH()
+    # to_train_model.load_state_dict(torch.load("models/CNN8_baseline_pretrain.pt", weights_only=True))
+    # to_train_model.eval()
+
+            mean_corrs = []
+            corrs_l = [[] for _ in to_train_model.conv_layers]
+            pearson_corr = count_mean_filter_correlation_model(mean_corrs, corrs_l)
+
+            model_quant, train_quant_state, test_quant_state = quantization(m_arch, NAME, to_train_model, 21, 25,
+                                                                            test_loader, train_loader, True,
+                                                                            model_update=None)
+
+            with open(f'{STATISTICS_PATH}/{NAME}_quant_corrls_L.json', 'w') as json_file:
+                results = {"mean_corrs": mean_corrs, "corrs_l": corrs_l}
+                json.dump(results, json_file, indent=2)
+        #
+# to_train_model = CNN6()
+# to_train_model.load_state_dict(torch.load("models/CNN6_ortho_pretrain.pt", weights_only=True))
 # to_train_model.eval()
-
-mean_corrs = []
-corrs_l = [[] for _ in to_train_model.conv_layers]
-pearson_corr = count_mean_filter_correlation_model(mean_corrs, corrs_l)
-
-model_quant, train_quant_state, test_quant_state = quantization(NAME, to_train_model, 21, 25, test_loader, train_loader, True,
-                                    model_update=pearson_corr)
-
-with open(f'{STATISTICS_PATH}/{NAME}_quant_corrls_L.json', 'w') as json_file:
-    results = {"mean_corrs": mean_corrs, "corrs_l": corrs_l}
-    json.dump(results, json_file, indent=2)
+#
+# mean_corrs = []
+# corrs_l = [[] for _ in to_train_model.conv_layers]
+# pearson_corr = count_mean_filter_correlation_model(mean_corrs, corrs_l)
+#
+# model_quant, train_quant_state, test_quant_state = quantization(CNN6, "CNN6_ortho", to_train_model, 21, 25,
+#                                                                 test_loader, train_loader, True,
+#                                                                 model_update=pearson_corr)
+#
+# with open(f'{STATISTICS_PATH}/CNN6_ortho_quant_corrls_L.json', 'w') as json_file:
+#     results = {"mean_corrs": mean_corrs, "corrs_l": corrs_l}
+#     json.dump(results, json_file, indent=2)

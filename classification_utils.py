@@ -38,7 +38,7 @@ def test_step(model, X, y:torch.Tensor, loss_function, device, k_max: int = 1):
 
 @torch.no_grad()
 def test(model, generator, loss_function=F.nll_loss, device=torch.device('cpu'),  k_max = 1, use_tqdm=False, n_batches: int = -1,
-         reg_loss=None):
+         reg_loss=None, model_upd=None):
     several_k = isinstance(k_max, list) or isinstance(k_max, tuple)
     model.train(mode=False)
     correct = 0 if not several_k else np.zeros([len(k_max)])
@@ -59,6 +59,13 @@ def test(model, generator, loss_function=F.nll_loss, device=torch.device('cpu'),
                         r_loss += reg(X, model)
                 else:
                     r_loss = reg_loss(X, model)
+
+            if model_upd is not None:
+                if isinstance(model_upd, list):
+                    for upd in model_upd[1:]:
+                        upd(model)
+                else:
+                    model_upd(model)
             losses.append(b_loss + r_loss)
     else:
         for X, y in generator:
@@ -73,6 +80,13 @@ def test(model, generator, loss_function=F.nll_loss, device=torch.device('cpu'),
                         r_loss += reg(X, model)
                 else:
                     r_loss = reg_loss(X, model)
+
+            if model_upd is not None:
+                if isinstance(model_upd, list):
+                    for upd in model_upd[1:]:
+                        upd(model)
+                else:
+                    model_upd(model)
             losses.append(b_loss + r_loss)
     accuracy = correct / total
     loss = np.mean(losses)
@@ -144,7 +158,7 @@ def train(model, opt, train_generator, test_generator, loss_function=F.nll_loss,
     for epoch in range(n_epochs):
         start_time = time()
         model.train(True)
-        generator = tqdm(train_generator, desc='training') if use_tqdm else train_generator
+        generator = tqdm(train_generator, desc=f'{epoch} training') if use_tqdm else train_generator
         for X, y in generator:
             b_loss, b_correct = train_step(model, opt, X, y, loss_function, device,
                                            model_regularization, model_update)
@@ -156,7 +170,7 @@ def train(model, opt, train_generator, test_generator, loss_function=F.nll_loss,
             scheduler.step()
 
         loss, acc = test(model, test_generator, loss_function=loss_function, use_tqdm=use_tqdm, device=device, n_batches=n_test_batches,
-                         reg_loss=model_regularization)
+                         reg_loss=model_regularization, model_upd=model_update)
         test_stat.append(loss, acc, global_step)
         end_time = time()
 

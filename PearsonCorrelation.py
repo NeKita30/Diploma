@@ -55,9 +55,9 @@ def correlation_loss(reg_coef, mean_corrs=None, corrs_l=None):
                     corrs_l[i].append(corr_l)
                 if mean_corrs is not None:
                     mean_corr += corr_l
-
-            norm = torch_norm(pearson_mat - torch.eye(pearson_mat.shape[0]))
-            summ += torch.square(norm)
+            if i != 0:
+                norm = torch_norm(pearson_mat - torch.eye(pearson_mat.shape[0]))
+                summ += torch.square(norm)
 
         if mean_corrs is not None:
             mean_corrs.append(float(summ / len(model.conv_layers)))

@@ -14,7 +14,7 @@ def ortho_step(wort, optim, max_projections=None):
         lr = optim.param_groups[0]['lr']
 
         with torch.no_grad():
-            for l_i, name in enumerate(model.conv_layers):
+            for l_i, name in enumerate(model.conv_layers[1:]):
                 layer = model.get_submodule(f"{name}")
                 layer_weight = layer.get_weight()
                 k = len(layer_weight)
@@ -28,7 +28,7 @@ def ortho_step(wort, optim, max_projections=None):
                             a, b = i, j
                             max_projection = proj
                 if max_projections is not None:
-                    max_projections[l_i].append(torch.norm(max_projection))
+                    max_projections[l_i].append(float(torch.norm(max_projection)))
 
                 layer_weight[a] = gram_schmidt(layer_weight[a],
                                                max_projection, lr, wort)
@@ -36,10 +36,10 @@ def ortho_step(wort, optim, max_projections=None):
     return step
 
 
-def pseudo_ortho(wort, optimizer, max_projections):
+def pseudo_ortho(_, __, max_projections):
     def step(model):
         with torch.no_grad():
-            for l_i, name in enumerate(model.conv_layers):
+            for l_i, name in enumerate(model.conv_layers[1:]):
                 layer = model.get_submodule(f"{name}")
                 layer_weight = layer.get_weight()
                 k = len(layer_weight)
@@ -53,5 +53,5 @@ def pseudo_ortho(wort, optimizer, max_projections):
                             a, b = i, j
                             max_projection = proj
 
-                max_projections[l_i].append(torch.norm(max_projection))
+                max_projections[l_i].append(float(torch.norm(max_projection)))
     return step
